@@ -2,6 +2,9 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart, Palace } from '@/lib/ziwei/types';
+import { buildSystemPrompt } from '@/lib/ziwei/chart-prompt';
+import { streamChatCompletion, loadLlmConfig } from '@/lib/llm/config';
+import { LlmSettingsButton } from './LlmSettings';
 import type { TimeView } from './TimeNav';
 
 interface Message {
@@ -276,43 +279,40 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
   const streamResponse = async (apiMessages: { role: 'user' | 'assistant'; content: string }[]) => {
     try {
-      const res = await fetch('/api/interpret', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chart, messages: apiMessages }),
-      });
-      if (res.status === 404) throw new Error('api-missing');
-      if (!res.ok) throw new Error('请求失败');
-      if (!res.body) throw new Error('无响应流');
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
+      const cfg = loadLlmConfig();
+      const allMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
+        { role: 'system', content: buildSystemPrompt(chart) },
+        ...apiMessages,
+      ];
 
       setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') break;
-          try {
-            const delta = JSON.parse(data).delta?.text ?? '';
-            assistantText += delta;
-            setMessages(prev => {
-              const updated = [...prev];
-              updated[updated.length - 1] = { role: 'assistant', content: assistantText };
-              return updated;
-            });
-          } catch { /* skip */ }
-        }
-      }
+      await streamChatCompletion(cfg, allMessages, delta => {
+        if (!delta) return;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          updated[updated.length - 1] = { ...last, content: last.content + delta };
+          return updated;
+        });
+      });
     } catch (e) {
-      const missing = e instanceof Error && e.message === 'api-missing';
-      setMessages(prev => [...prev, { role: 'assistant', content: missing ? '开源版不含 AI 解读接口（/api/interpret），需要你自己实现后才能用，详见 README「快速开始」。排盘本身不需要任何 API Key。' : '解读失败，请稍后重试。' }]);
+      const cfg = loadLlmConfig();
+      const isLocalhost = /localhost|127\.0\.0\.1/.test(cfg.endpoint);
+      const hint = isLocalhost
+        ? `无法连接本地模型（${cfg.endpoint}）。请检查：1) LM Studio / Ollama 服务是否已启动；2) LM Studio「Server 设置」中是否开启 CORS（跨域）；3) 点击右上角「⚙ 接口」检查地址与模型名。`
+        : `无法连接 AI 接口（${cfg.endpoint}）。请点击右上角「⚙ 接口」检查地址、模型名与 Key。`;
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        const errText = `${hint}${e instanceof Error && e.message.startsWith('HTTP') ? `\n\n详情：${e.message}` : ''}`;
+        if (last && last.role === 'assistant' && last.content === '') {
+          updated[updated.length - 1] = { ...last, content: errText };
+        } else {
+          updated.push({ role: 'assistant', content: errText });
+        }
+        return updated;
+      });
     } finally {
       setLoading(false);
       loadingRef.current = false;
@@ -351,25 +351,28 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
       {/* ── Topic buttons ── */}
       <div className="flex-shrink-0 px-2 pt-2.5 pb-2" style={{ borderBottom: '1px solid var(--t-border)' }}>
-        <div className="grid grid-cols-6 gap-1">
-          {TOPICS.map(t => {
-            const isActive = activeTopic === t.key;
-            return (
-              <button
-                key={t.key}
-                onClick={() => handleTopicClick(t.key)}
-                disabled={loading}
-                className="py-1.5 text-[10px] font-medium rounded-lg transition-all duration-150 disabled:opacity-40"
-                style={{
-                  background: isActive ? 'rgba(212,168,67,0.12)' : 'transparent',
-                  border: `1px solid ${isActive ? 'rgba(212,168,67,0.3)' : 'var(--t-border)'}`,
-                  color: isActive ? 'var(--t-gold)' : 'var(--t-faint)',
-                }}
-              >
-                {t.label}
-              </button>
-            );
-          })}
+        <div className="flex items-center gap-1">
+          <div className="grid grid-cols-6 gap-1 flex-1">
+            {TOPICS.map(t => {
+              const isActive = activeTopic === t.key;
+              return (
+                <button
+                  key={t.key}
+                  onClick={() => handleTopicClick(t.key)}
+                  disabled={loading}
+                  className="py-1.5 text-[10px] font-medium rounded-lg transition-all duration-150 disabled:opacity-40"
+                  style={{
+                    background: isActive ? 'rgba(212,168,67,0.12)' : 'transparent',
+                    border: `1px solid ${isActive ? 'rgba(212,168,67,0.3)' : 'var(--t-border)'}`,
+                    color: isActive ? 'var(--t-gold)' : 'var(--t-faint)',
+                  }}
+                >
+                  {t.label}
+                </button>
+              );
+            })}
+          </div>
+          <LlmSettingsButton compact />
         </div>
       </div>
 
