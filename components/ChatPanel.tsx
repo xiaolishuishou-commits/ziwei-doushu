@@ -2,6 +2,9 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart } from '@/lib/ziwei/types';
+import { buildSystemPrompt } from '@/lib/ziwei/chart-prompt';
+import { streamChatCompletion, loadLlmConfig } from '@/lib/llm/config';
+import { LlmSettingsButton } from './LlmSettings';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -41,50 +44,44 @@ export default function ChatPanel({ chart }: ChatPanelProps) {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/interpret', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chart, messages: [...messages, userMsg] }),
-      });
-
-      if (res.status === 404) throw new Error('api-missing');
-      if (!res.ok) throw new Error('请求失败');
-      if (!res.body) throw new Error('无响应流');
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
+      const cfg = loadLlmConfig();
+      const history: { role: 'user' | 'assistant'; content: string }[] = [...messages, userMsg].map(m => ({
+        role: m.role,
+        content: m.content,
+      }));
+      const allMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
+        { role: 'system', content: buildSystemPrompt(chart) },
+        ...history,
+      ];
 
       setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') break;
-            try {
-              const parsed = JSON.parse(data);
-              const delta = parsed.delta?.text ?? '';
-              assistantText += delta;
-              setMessages(prev => {
-                const updated = [...prev];
-                updated[updated.length - 1] = { role: 'assistant', content: assistantText };
-                return updated;
-              });
-            } catch { /* skip */ }
-          }
-        }
-      }
+      await streamChatCompletion(cfg, allMessages, delta => {
+        if (!delta) return;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          updated[updated.length - 1] = { ...last, content: last.content + delta };
+          return updated;
+        });
+      });
     } catch (e) {
-      const missing = e instanceof Error && e.message === 'api-missing';
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: missing ? '开源版不含 AI 解读接口（/api/interpret），需要你自己实现后才能用，详见 README「快速开始」。排盘本身不需要任何 API Key。' : '解读失败，请检查API配置或稍后重试。',
-      }]);
+      const cfg = loadLlmConfig();
+      const isLocalhost = /localhost|127\.0\.0\.1/.test(cfg.endpoint);
+      const hint = isLocalhost
+        ? `无法连接本地模型（${cfg.endpoint}）。请检查：1) LM Studio / Ollama 服务是否已启动；2) LM Studio「Server 设置」中是否开启 CORS（跨域）；3) 点击右上角「⚙ 接口」检查地址与模型名。`
+        : `无法连接 AI 接口（${cfg.endpoint}）。请点击「⚙ 接口」检查地址、模型名与 Key。`;
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        const errText = `${hint}${e instanceof Error && e.message.startsWith('HTTP') ? `\n\n详情：${e.message}` : ''}`;
+        if (last && last.role === 'assistant' && last.content === '') {
+          updated[updated.length - 1] = { ...last, content: errText };
+        } else {
+          updated.push({ role: 'assistant', content: errText });
+        }
+        return updated;
+      });
     } finally {
       setLoading(false);
     }
@@ -93,9 +90,12 @@ export default function ChatPanel({ chart }: ChatPanelProps) {
   return (
     <div className="flex flex-col h-full rounded-xl overflow-hidden card-glass">
       {/* 标题 */}
-      <div className="px-4 py-3 flex-shrink-0" style={{ borderBottom: '1px solid var(--t-border)' }}>
-        <h3 className="text-xs font-medium tracking-widest" style={{ color: 'var(--t-gold)' }}>AI 命盘解读</h3>
-        <p className="text-[10px] mt-0.5" style={{ color: 'var(--t-faint)' }}>倪海厦正宗紫微斗数 · 智慧解析</p>
+      <div className="px-4 py-3 flex-shrink-0 flex items-center justify-between" style={{ borderBottom: '1px solid var(--t-border)' }}>
+        <div>
+          <h3 className="text-xs font-medium tracking-widest" style={{ color: 'var(--t-gold)' }}>AI 命盘解读</h3>
+          <p className="text-[10px] mt-0.5" style={{ color: 'var(--t-faint)' }}>倪海厦正宗紫微斗数 · 本地模型解析</p>
+        </div>
+        <LlmSettingsButton />
       </div>
 
       {/* 消息列表 */}
